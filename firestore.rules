@@ -1,0 +1,423 @@
+/**
+ * CompanyOS — Cloud Firestore Security Rules (v0.1 prototype)
+ *
+ * ===============================================================
+ * Assumed Data Model
+ * ===============================================================
+ *
+ * Collection: users
+ * Document ID: the Firebase Auth UID of the user
+ * Fields:
+ *   - uid:        string    (required, immutable, must equal the document ID)
+ *   - name:       string    (required, 1..100) - display name
+ *   - email:      string    (required, immutable from clients, valid email)
+ *   - role:       string    (required, one of "employee" | "manager" | "admin")
+ *                           NEVER self-assignable. Forced to "employee" on
+ *                           self sign-up; only an admin may change it.
+ *   - department: string    (required, 1..60) - team scope for managers.
+ *                           Forced to "Unassigned" on self sign-up; only an
+ *                           admin may change it. Self-assignment would let a
+ *                           user read another department's data.
+ *   - photoURL:   string    (optional, <=2000)
+ *   - createdAt:  timestamp (required, immutable)
+ *   - updatedAt:  timestamp (optional)
+ *
+ * Collection: attendance
+ * Document ID: "{userId}_{YYYY-MM-DD}" (one record per user per day)
+ * Fields:
+ *   - userId:         string    (required, immutable)
+ *   - department:     string    (required) - denormalized from users
+ *   - date:           string    (required, "YYYY-MM-DD")
+ *   - checkIn:        timestamp (required)
+ *   - checkOut:       timestamp | null
+ *   - breaks:         list of maps { start: timestamp, end: timestamp|null }
+ *   - breakMinutes:   number    (required, >=0)
+ *   - workingMinutes: number    (required, >=0)
+ *   - status:         string    ("checked_in" | "on_break" | "checked_out")
+ *   - createdAt/updatedAt: timestamp
+ * NOTE: This collection is READ-ONLY to all clients. Every write happens in a
+ * callable Cloud Function using the Admin SDK (which bypasses these rules), so
+ * employees cannot forge their own working hours.
+ *
+ * Collection: tasks
+ * Document ID: auto-generated
+ * Fields:
+ *   - title:       string    (required, 1..200)
+ *   - description: string    (optional, <=5000)
+ *   - assigneeId:  string    (required) - uid of the employee doing the work
+ *   - createdBy:   string    (required, immutable) - uid of the manager/admin
+ *   - department:  string    (required) - denormalized; scopes manager access
+ *   - status:      string    ("todo" | "in_progress" | "blocked" | "done")
+ *   - priority:    string    ("low" | "medium" | "high" | "urgent")
+ *   - progress:    number    (required, 0..100)
+ *   - dueDate:     timestamp | null (optional)
+ *   - createdAt:   timestamp (required, immutable)
+ *   - updatedAt:   timestamp (optional)
+ *
+ * Collection: activities
+ * Document ID: auto-generated
+ * Fields:
+ *   - userId:      string    (required, immutable) - who did the work
+ *   - taskId:      string    (required, immutable) - task the work belongs to
+ *   - department:  string    (required, immutable) - denormalized
+ *   - description: string    (required, 1..2000) - what they actually did
+ *   - duration:    number    (required, 1..1440) - minutes spent
+ *   - createdAt:   timestamp (required, immutable)
+ *   - updatedAt:   timestamp (optional)
+ *
+ * ===============================================================
+ * Key security decisions
+ * ===============================================================
+ *
+ * - Default deny. Nothing is readable or writable without an explicit allow.
+ * - No privilege escalation: `role` and `department` can never be written by
+ *   the account they belong to. Sign-up hardcodes "employee"/"Unassigned".
+ * - Manager scope is by DEPARTMENT. `department` is denormalized onto
+ *   attendance/tasks/activities so a manager-scoped rule needs ONE cached
+ *   lookup of the caller's own profile, instead of a per-document get() on the
+ *   record's owner (which would exceed Firestore's 20-get() query limit).
+ * - Attendance integrity is server-authoritative: clients can read, never write.
+ * - Rules are not filters, and for a `list` this is stricter than it first
+ *   appears: Firestore binds `resource.data` to ONLY the fields the query
+ *   constrains, then requires the rule to pass for every possible match. A
+ *   field the rule reads but the query does not filter on is simply undefined,
+ *   and the rule errors rather than returning false.
+ *
+ *   Practical consequence: every list query must filter on a field that lets
+ *   one clause of the relevant read rule evaluate to true.
+ *     activities  -> filter on `userId` (own) or `department` (manager/admin)
+ *     tasks       -> filter on `assigneeId`, `createdBy`, or `department`
+ *     attendance  -> filter on `userId` (own) or `department` (manager/admin)
+ *   Filtering on `taskId` alone, for example, is always rejected.
+ *   The helpers in src/lib/services already do this; prefer them over
+ *   hand-written queries.
+ *
+ * KNOWN, DELIBERATE TRADE-OFF: managers can read `users` documents in their own
+ * department, which includes the email address. This is the explicit product
+ * requirement (viewing team attendance requires resolving names). It is scoped
+ * to the manager's own department; employees can never read another user's
+ * profile.
+ */
+rules_version = "2";
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // =============================================================
+    // Identity helpers
+    // =============================================================
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isSelf(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    // True only when the caller has a profile document. Guards every role
+    // lookup so a signed-in user without a profile is denied rather than
+    // erroring out mid-evaluation.
+    function hasProfile() {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    function myProfile() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function myRole() {
+      return hasProfile() ? myProfile().role : "none";
+    }
+
+    function myDept() {
+      return hasProfile() ? myProfile().department : "__no_department__";
+    }
+
+    function isAdmin() {
+      return myRole() == "admin";
+    }
+
+    function isManager() {
+      return myRole() == "manager";
+    }
+
+    function isManagerOrAdmin() {
+      return isAdmin() || isManager();
+    }
+
+    // Admins see every department; managers see only their own.
+    function canSeeDept(dept) {
+      return isAdmin() || (isManager() && myDept() == dept);
+    }
+
+    // =============================================================
+    // Generic field helpers
+    // =============================================================
+
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    // Keys whose value actually changed in this update.
+    function changedKeys() {
+      return request.resource.data.diff(resource.data).affectedKeys();
+    }
+
+    function onlyChanged(fields) {
+      return changedKeys().hasOnly(fields);
+    }
+
+    function areImmutableFieldsUnchanged(fields) {
+      return !changedKeys().hasAny(fields);
+    }
+
+    function isValidEmail(email) {
+      return email is string &&
+        email.matches("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$");
+    }
+
+    function isStringBetween(value, minLen, maxLen) {
+      return value is string &&
+        value.size() >= minLen &&
+        value.size() <= maxLen;
+    }
+
+    function isOptionalStringUpTo(data, field, maxLen) {
+      return !(field in data) ||
+        (data[field] is string && data[field].size() <= maxLen);
+    }
+
+    function isOptionalTimestamp(data, field) {
+      return !(field in data) ||
+        data[field] == null ||
+        data[field] is timestamp;
+    }
+
+    // =============================================================
+    // Domain validators — applied on BOTH create and update so a document
+    // can never be created valid and then mutated into an invalid state.
+    // =============================================================
+
+    function isValidUser(data) {
+      return hasOnlyAllowedFields([
+          "uid", "name", "email", "role", "department",
+          "photoURL", "createdAt", "updatedAt",
+        ]) &&
+        hasRequiredFields([
+          "uid", "name", "email", "role", "department", "createdAt",
+        ]) &&
+        data.uid is string &&
+        isStringBetween(data.name, 1, 100) &&
+        isValidEmail(data.email) &&
+        data.role in ["employee", "manager", "admin"] &&
+        isStringBetween(data.department, 1, 60) &&
+        data.createdAt is timestamp &&
+        isOptionalStringUpTo(data, "photoURL", 2000) &&
+        isOptionalTimestamp(data, "updatedAt");
+    }
+
+    function isValidTask(data) {
+      return hasOnlyAllowedFields([
+          "title", "description", "assigneeId", "createdBy", "department",
+          "status", "priority", "progress", "dueDate",
+          "createdAt", "updatedAt",
+        ]) &&
+        hasRequiredFields([
+          "title", "assigneeId", "createdBy", "department",
+          "status", "priority", "progress", "createdAt",
+        ]) &&
+        isStringBetween(data.title, 1, 200) &&
+        isOptionalStringUpTo(data, "description", 5000) &&
+        data.assigneeId is string &&
+        data.createdBy is string &&
+        isStringBetween(data.department, 1, 60) &&
+        isValidTaskStatus(data.status) &&
+        data.priority in ["low", "medium", "high", "urgent"] &&
+        isValidProgress(data.progress) &&
+        isOptionalTimestamp(data, "dueDate") &&
+        data.createdAt is timestamp &&
+        isOptionalTimestamp(data, "updatedAt");
+    }
+
+    function isValidTaskStatus(status) {
+      return status in ["todo", "in_progress", "blocked", "done"];
+    }
+
+    function isValidProgress(progress) {
+      return progress is number && progress >= 0 && progress <= 100;
+    }
+
+    function isValidActivity(data) {
+      return hasOnlyAllowedFields([
+          "userId", "taskId", "department", "description",
+          "duration", "createdAt", "updatedAt",
+        ]) &&
+        hasRequiredFields([
+          "userId", "taskId", "department", "description",
+          "duration", "createdAt",
+        ]) &&
+        data.userId is string &&
+        isStringBetween(data.taskId, 1, 200) &&
+        isStringBetween(data.department, 1, 60) &&
+        isStringBetween(data.description, 1, 2000) &&
+        data.duration is number &&
+        data.duration > 0 &&
+        data.duration <= 1440 &&
+        data.createdAt is timestamp &&
+        isOptionalTimestamp(data, "updatedAt");
+    }
+
+    // =============================================================
+    // users
+    // =============================================================
+    //
+    // @allow  A user reading/updating their own profile; a manager reading a
+    //         profile in their own department; an admin reading any profile.
+    // @deny   An employee reading a colleague's profile; anyone setting their
+    //         own role or department; any client deleting a profile.
+    // @principle Ownership for writes, department-scoped RBAC for reads, and
+    //         an absolute block on self-escalation of role/department.
+    //
+    match /users/{userId} {
+
+      allow read: if isSelf(userId) || canSeeDept(resource.data.department);
+
+      // Self sign-up only. Role and department are HARDCODED here — this is
+      // what prevents a new account from granting itself admin or joining
+      // another department. An admin promotes users via the `setUserRole`
+      // callable Function (Admin SDK, bypasses these rules).
+      allow create: if isSelf(userId) &&
+        isValidUser(request.resource.data) &&
+        request.resource.data.uid == userId &&
+        request.resource.data.role == "employee" &&
+        request.resource.data.department == "Unassigned";
+
+      // Self: may edit ONLY their display name / photo.
+      // Admin: full edit, but identity fields stay immutable.
+      allow update: if isValidUser(request.resource.data) &&
+        request.resource.data.uid == resource.data.uid &&
+        (
+          (
+            isSelf(userId) &&
+            onlyChanged(["name", "photoURL", "updatedAt"])
+          ) ||
+          (
+            isAdmin() &&
+            areImmutableFieldsUnchanged(["uid", "email", "createdAt"])
+          )
+        );
+
+      allow delete: if isAdmin();
+    }
+
+    // =============================================================
+    // attendance
+    // =============================================================
+    //
+    // @allow  An employee reading their own attendance; a manager reading
+    //         attendance for their department; an admin reading all.
+    // @deny   EVERY client write, and any cross-department read.
+    // @principle Server-authoritative. Check in/out and breaks are written
+    //         only by callable Cloud Functions using server clock values, so
+    //         working hours cannot be fabricated from the client.
+    //
+    match /attendance/{attendanceId} {
+
+      allow read: if isSelf(resource.data.userId) ||
+        canSeeDept(resource.data.department);
+
+      allow create, update, delete: if false;
+    }
+
+    // =============================================================
+    // tasks
+    // =============================================================
+    //
+    // @allow  The assignee reading their task and updating ONLY its status and
+    //         progress; a manager creating/editing tasks in their department;
+    //         an admin doing anything.
+    // @deny   An assignee reassigning a task, rewriting its title, or changing
+    //         its department; a manager touching another department's tasks.
+    // @principle Field-level restriction for the assignee, department-scoped
+    //         RBAC for managers. The assignee branch checks ownership AND the
+    //         changed-field set, so it cannot be used to edit someone else's
+    //         task metadata.
+    //
+    match /tasks/{taskId} {
+
+      allow read: if isSelf(resource.data.assigneeId) ||
+        isSelf(resource.data.createdBy) ||
+        canSeeDept(resource.data.department);
+
+      // Only managers/admins create work. A manager is pinned to their own
+      // department, which also stops them assigning across teams.
+      allow create: if isManagerOrAdmin() &&
+        isValidTask(request.resource.data) &&
+        request.resource.data.createdBy == request.auth.uid &&
+        (isAdmin() || request.resource.data.department == myDept());
+
+      allow update: if isValidTask(request.resource.data) &&
+        areImmutableFieldsUnchanged(["createdBy", "createdAt"]) &&
+        (
+          (
+            // Assignee: progress reporting only.
+            isSelf(resource.data.assigneeId) &&
+            onlyChanged(["status", "progress", "updatedAt"])
+          ) ||
+          (
+            // Manager/admin: full edit within their own scope. The department
+            // is checked both before and after so a task cannot be moved out
+            // of (or into) a department the caller does not control.
+            isManagerOrAdmin() &&
+            canSeeDept(resource.data.department) &&
+            canSeeDept(request.resource.data.department)
+          )
+        );
+
+      allow delete: if isManagerOrAdmin() &&
+        canSeeDept(resource.data.department);
+    }
+
+    // =============================================================
+    // activities
+    // =============================================================
+    //
+    // @allow  An employee logging and reading their own activities; a manager
+    //         reading their department's activities; an admin reading all.
+    // @deny   Logging an activity on behalf of another user, logging into
+    //         another department, or reading a colleague's activity log.
+    // @principle Ownership on write (userId pinned to the caller), plus the
+    //         department pinned to the caller's real department so the record
+    //         cannot be hidden from — or injected into — another team's feed.
+    //
+    match /activities/{activityId} {
+
+      allow read: if isSelf(resource.data.userId) ||
+        canSeeDept(resource.data.department);
+
+      allow create: if isSelf(request.resource.data.userId) &&
+        isValidActivity(request.resource.data) &&
+        request.resource.data.department == myDept();
+
+      allow update: if isValidActivity(request.resource.data) &&
+        areImmutableFieldsUnchanged([
+          "userId", "taskId", "department", "createdAt",
+        ]) &&
+        (
+          (
+            isSelf(resource.data.userId) &&
+            onlyChanged(["description", "duration", "updatedAt"])
+          ) ||
+          isAdmin()
+        );
+
+      allow delete: if isSelf(resource.data.userId) || isAdmin();
+    }
+  }
+}
